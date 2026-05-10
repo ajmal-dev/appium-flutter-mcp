@@ -9,6 +9,7 @@ export interface AppiumFlutterConfig {
   sessionId?: string;
 
   // Appium capabilities (user-configurable per device)
+  automationName: string;
   udid?: string;
   bundleId?: string;
   appPackage?: string;
@@ -44,6 +45,7 @@ export interface AppiumFlutterConfig {
 const defaults: AppiumFlutterConfig = {
   appiumUrl: 'http://127.0.0.1:4723',
   platform: 'ios',
+  automationName: 'FlutterIntegration',
   flutterServerLaunchTimeout: 10000,
   flutterSystemPort: 10001,
   flutterElementWaitTimeout: 5000,
@@ -63,6 +65,7 @@ export function loadConfig(overrides?: Partial<AppiumFlutterConfig>): AppiumFlut
     sessionId: process.env.SESSION_ID || undefined,
 
     // Appium capabilities from env
+    automationName: process.env.APPIUM_AUTOMATION_NAME || defaults.automationName,
     udid: process.env.APPIUM_UDID || undefined,
     bundleId: process.env.APPIUM_BUNDLE_ID || undefined,
     appPackage: process.env.APPIUM_APP_PACKAGE || undefined,

@@ -75,6 +75,11 @@ idevice_id -l                       # or: xcrun xctrace list devices
         "APPIUM_URL": "http://127.0.0.1:4723",
         "PLATFORM": "ios",
 
+        // Optional — defaults to FlutterIntegration. Override with "XCUITest"
+        // for a pure native iOS app, etc. Flutter-specific caps are only
+        // applied when this is FlutterIntegration.
+        "APPIUM_AUTOMATION_NAME": "FlutterIntegration",
+
         "APPIUM_UDID": "00008101-000XXXXXXXXXXXXX",   // idevice_id -l
         "APPIUM_BUNDLE_ID": "com.example.yourapp",
         "APPIUM_DEVICE_NAME": "iPhone",
@@ -113,6 +118,10 @@ adb devices
       "env": {
         "APPIUM_URL": "http://127.0.0.1:4723",
         "PLATFORM": "android",
+
+        // Optional — defaults to FlutterIntegration. Override with
+        // "UiAutomator2" / "Espresso" for a pure native Android app.
+        "APPIUM_AUTOMATION_NAME": "FlutterIntegration",
 
         "APPIUM_UDID": "emulator-5554",                       // adb devices
         "APPIUM_APP_PACKAGE": "com.example.yourapp",
@@ -218,6 +227,7 @@ Every option below is read from the process environment (or a `.env` file at the
 | `APPIUM_URL` | `http://127.0.0.1:4723` | Appium server URL |
 | `PLATFORM` | `ios` | `ios` or `android` |
 | `SESSION_ID` | — | Attach to an existing Appium session instead of creating one |
+| `APPIUM_AUTOMATION_NAME` | `FlutterIntegration` | Driver / automation engine. Use `XCUITest`, `UiAutomator2`, `Espresso`, etc. for non-Flutter apps |
 | `APPIUM_UDID` | — | iOS device UDID / Android serial |
 | `APPIUM_BUNDLE_ID` | — | iOS bundle ID |
 | `APPIUM_APP_PACKAGE` | — | Android package |

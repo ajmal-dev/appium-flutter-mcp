@@ -4,6 +4,9 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
+### Added
+- `APPIUM_AUTOMATION_NAME` env var. Defaults to `FlutterIntegration`; override with `XCUITest`, `UiAutomator2`, `Espresso`, etc. to drive non-Flutter apps. Flutter-specific capabilities are only sent to Appium when the chosen driver is `FlutterIntegration`.
+
 ## [1.0.0] - 2026-05-10
 
 Initial public release.

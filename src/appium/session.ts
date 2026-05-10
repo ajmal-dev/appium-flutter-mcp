@@ -128,17 +128,23 @@ export async function createSession(
     };
   }
 
-  // Build capabilities
+  // Build capabilities. The Flutter-specific tunables only apply to
+  // automationName="FlutterIntegration"; for plain XCUITest / UiAutomator2
+  // they're omitted to avoid confusing those drivers.
+  const automationName = config.automationName;
+  const isFlutter = /flutter/i.test(automationName);
   let caps: Record<string, unknown> = {
     platformName: platform === 'ios' ? 'iOS' : 'Android',
-    'appium:automationName': 'FlutterIntegration',
-    'appium:flutterServerLaunchTimeout': config.flutterServerLaunchTimeout,
-    'appium:flutterSystemPort': config.flutterSystemPort,
-    'appium:flutterElementWaitTimeout': config.flutterElementWaitTimeout,
-    'appium:flutterScrollMaxIteration': config.flutterScrollMaxIteration,
-    'appium:flutterScrollDelta': config.flutterScrollDelta,
+    'appium:automationName': automationName,
     'appium:newCommandTimeout': 300,
   };
+  if (isFlutter) {
+    caps['appium:flutterServerLaunchTimeout'] = config.flutterServerLaunchTimeout;
+    caps['appium:flutterSystemPort'] = config.flutterSystemPort;
+    caps['appium:flutterElementWaitTimeout'] = config.flutterElementWaitTimeout;
+    caps['appium:flutterScrollMaxIteration'] = config.flutterScrollMaxIteration;
+    caps['appium:flutterScrollDelta'] = config.flutterScrollDelta;
+  }
 
   // Apply capabilities from config (env vars / MCP JSON config)
   if (config.udid) caps['appium:udid'] = config.udid;
