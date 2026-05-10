@@ -30,7 +30,8 @@ Common to both platforms:
 | Node.js | ≥ 18 |
 | Appium | 2.x running locally — `appium` |
 | Flutter driver | `appium driver install --source=npm appium-flutter-integration-driver` |
-| App | Your Flutter app launched in **debug** or **profile** mode (so the Dart VM Service is exposed) |
+| App | Your Flutter app launched in **debug** or **profile** mode (so the Dart VM Service is exposed) and running using |
+| Your App must run on flutter appium integration driver : https://github.com/AppiumTestDistribution/appium-flutter-integration-driver|
 
 Platform-specific:
 
