@@ -2,7 +2,7 @@
 
 > An [MCP](https://modelcontextprotocol.io) server that lets AI assistants drive **Flutter** (and hybrid Flutter + WebView + Native) apps through Appium — with natural-language locators, source-aware ValueKey discovery, self-healing tests, and vision-led test execution.
 
-[![CI](https://github.com/USER/appium-flutter-mcp/actions/workflows/ci.yml/badge.svg)](#)
+[![CI](https://github.com/ajmal-dev/appium-flutter-mcp/actions/workflows/ci.yml/badge.svg)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](#)
 
@@ -44,7 +44,7 @@ Platform-specific:
 ### 2. Install
 
 ```bash
-git clone https://github.com/USER/appium-flutter-mcp.git
+git clone https://github.com/ajmal-dev/appium-flutter-mcp.git
 cd appium-flutter-mcp
 npm install
 npm run build

@@ -39,11 +39,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/ajmal-dev/appium-flutter-mcp.git"
   },
-  "homepage": "",
+  "homepage": "https://github.com/ajmal-dev/appium-flutter-mcp#readme",
   "bugs": {
-    "url": ""
+    "url": "https://github.com/ajmal-dev/appium-flutter-mcp/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
