@@ -1,0 +1,26 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+
+# Local env / secrets
+.env
+
+# Per-machine MCP / editor settings
+.claude.json
+.claude/settings.local.json
+
+# Runtime artifacts
+logs/
+*.log
+runs/
+
+# CUA learned-hint sidecars (kept next to the test markdown, not in this repo)
+*.hints.json
+
+# Per-device recorder config
+recorder-config.json
+
+# Build output for the optional inspector
+dist-recorder/
+src/recorder-ui/renderer/bundle.js

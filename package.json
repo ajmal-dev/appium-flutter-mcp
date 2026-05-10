@@ -1,0 +1,68 @@
+{
+  "name": "appium-flutter-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for driving Flutter (and hybrid Flutter + WebView + Native) apps via Appium and the appium-flutter-integration-driver.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "appium-flutter-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "postbuild": "chmod +x dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"No tests yet — see CONTRIBUTING.md\" && exit 0",
+    "prepublishOnly": "npm run build",
+    "inspector": "npm run build && cp -r src/inspector/renderer dist/inspector/ && cp src/inspector/preload.cjs dist/inspector/ && electron dist/inspector/main.js",
+    "inspector:dev": "tsc && cp -r src/inspector/renderer dist/inspector/ && cp src/inspector/preload.cjs dist/inspector/ && electron dist/inspector/main.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "appium",
+    "flutter",
+    "test-automation",
+    "mobile-testing",
+    "claude",
+    "anthropic"
+  ],
+  "author": "Ajmal Mohammed",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "homepage": "",
+  "bugs": {
+    "url": ""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@xmldom/xmldom": "^0.9.9",
+    "dotenv": "^16.4.7",
+    "webdriverio": "^9.14.0",
+    "winston": "^3.17.0",
+    "ws": "^8.20.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/electron": "^1.4.38",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
+    "electron": "^41.2.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
