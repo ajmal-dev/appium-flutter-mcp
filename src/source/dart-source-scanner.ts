@@ -4,11 +4,6 @@
  *
  * Uses regex-based extraction (no Dart AST dependency).
  * Requires FLUTTER_APP_PATH and/or FLUTTER_COMPONENTS_PATH env vars.
- *
- * Conventions:
- *  - {FLUTTER_APP_PATH}/lib                    — main app source
- *  - {FLUTTER_APP_PATH}/lib/test_keys          — preferred ValueKey registry
- *  - {FLUTTER_COMPONENTS_PATH}/<pkg>/lib       — shared package source
  */
 
 import { readFileSync, readdirSync, statSync, existsSync } from 'fs';
@@ -95,7 +90,7 @@ export function buildDartSourceIndex(
       }
     }
 
-    // Priority 2: scan rest of {flutterAppPath}/lib
+    // Priority 2: scan the rest of lib/
     const appLibDir = join(flutterAppPath, 'lib');
     if (existsSync(appLibDir)) {
       const dartFiles = collectDartFiles(appLibDir);

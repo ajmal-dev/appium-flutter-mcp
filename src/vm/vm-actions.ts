@@ -3,24 +3,25 @@ import { vmLogger as logger } from './vm-logger.js';
 
 /**
  * Flutter Driver actions via direct Dart VM Service Protocol.
- * Uses ext.flutter.driver.* extensions for element interaction.
+ *
+ * PROTOCOL (verified live against the ZMA front-desk app): flutter_driver's
+ * `enableFlutterDriverExtension()` registers a SINGLE service extension named
+ * `ext.flutter.driver` that dispatches on a `command` param — there are NO
+ * per-command methods like `ext.flutter.driver.tap`. (The old code called
+ * those and failed with "Unknown method" (-32601) on every action, silently
+ * falling back to the much slower Appium path.)
+ *
+ * Command serialization mirrors flutter_driver's Command.serialize():
+ *   { command: 'tap'|'waitFor'|'enter_text'|..., timeout: <ms string>,
+ *     ...finder.serialize() }   // finderType, keyValueString, text, etc.
+ * The extension replies { isError: bool, response: {...} }.
  */
 
 // --- Finder Types ---
 
 export type FinderType = 'ByValueKey' | 'ByText' | 'ByType' | 'BySemanticsLabel' | 'ByTooltipMessage';
 
-interface FinderSpec {
-  finderType: FinderType;
-  keyValueString?: string;
-  keyValueType?: string;
-  text?: string;
-  type?: string;
-  label?: string;
-  isRegExp?: boolean;
-}
-
-function buildFinder(by: string, value: string): FinderSpec {
+function buildFinder(by: string, value: string): Record<string, string> {
   switch (by) {
     case 'key':
       return { finderType: 'ByValueKey', keyValueString: value, keyValueType: 'String' };
@@ -29,7 +30,7 @@ function buildFinder(by: string, value: string): FinderSpec {
     case 'type':
       return { finderType: 'ByType', type: value };
     case 'semanticsLabel':
-      return { finderType: 'BySemanticsLabel', label: value, isRegExp: false };
+      return { finderType: 'BySemanticsLabel', label: value, isRegExp: 'false' };
     case 'tooltip':
       return { finderType: 'ByTooltipMessage', text: value };
     default:
@@ -37,18 +38,38 @@ function buildFinder(by: string, value: string): FinderSpec {
   }
 }
 
+/** Invoke one flutter_driver command through the single ext.flutter.driver endpoint. */
+async function driverCommand(
+  client: DartVMClient,
+  command: string,
+  params: Record<string, string> = {},
+): Promise<Record<string, unknown>> {
+  const result = await client.callServiceExtension('ext.flutter.driver', {
+    command,
+    ...params,
+  }) as { isError?: boolean; response?: unknown };
+
+  if (result && result.isError) {
+    throw new Error(`flutter_driver ${command} failed: ${JSON.stringify(result.response ?? result)}`);
+  }
+  return (result?.response ?? {}) as Record<string, unknown>;
+}
+
+const msTimeout = (seconds: number | undefined, fallbackSec: number): string =>
+  String(Math.round((seconds ?? fallbackSec) * 1000));
+
 // --- Actions ---
 
 export async function vmTap(client: DartVMClient, by: string, value: string, timeout?: number): Promise<void> {
   const finder = buildFinder(by, value);
   const startMs = Date.now();
 
-  // Wait for element first
+  // Wait for element first (same contract as FlutterDriver.tap's implicit wait)
   await vmWaitFor(client, by, value, timeout || 10);
 
-  await client.callServiceExtension('ext.flutter.driver.tap', {
+  await driverCommand(client, 'tap', {
     ...finder,
-    timeout: String((timeout || 10) * 1000000), // microseconds
+    timeout: msTimeout(timeout, 10),
   });
 
   logger.info('VM tap', { by, value, elapsedMs: Date.now() - startMs });
@@ -57,9 +78,7 @@ export async function vmTap(client: DartVMClient, by: string, value: string, tim
 export async function vmEnterText(client: DartVMClient, text: string): Promise<void> {
   const startMs = Date.now();
 
-  await client.callServiceExtension('ext.flutter.driver.enterText', {
-    text,
-  });
+  await driverCommand(client, 'enter_text', { text });
 
   logger.info('VM enterText', { textLength: text.length, elapsedMs: Date.now() - startMs });
 }
@@ -75,13 +94,13 @@ export async function vmScroll(
 ): Promise<void> {
   const finder = buildFinder(by, value);
 
-  await client.callServiceExtension('ext.flutter.driver.scroll', {
+  await driverCommand(client, 'scroll', {
     ...finder,
     dx: String(dx),
     dy: String(dy),
-    duration: String(durationMs * 1000), // microseconds
+    duration: String(durationMs * 1000), // Scroll serializes duration in MICROseconds
     frequency: '60',
-    timeout: String((timeout || 10) * 1000000),
+    timeout: msTimeout(timeout, 10),
   });
 
   logger.info('VM scroll', { by, value, dx, dy });
@@ -90,34 +109,35 @@ export async function vmScroll(
 export async function vmWaitFor(client: DartVMClient, by: string, value: string, timeout: number = 10): Promise<void> {
   const finder = buildFinder(by, value);
 
-  await client.callServiceExtension('ext.flutter.driver.waitFor', {
+  await driverCommand(client, 'waitFor', {
     ...finder,
-    timeout: String(timeout * 1000000), // microseconds
+    timeout: msTimeout(timeout, 10),
   });
 }
 
 export async function vmWaitForAbsent(client: DartVMClient, by: string, value: string, timeout: number = 10): Promise<void> {
   const finder = buildFinder(by, value);
 
-  await client.callServiceExtension('ext.flutter.driver.waitForAbsent', {
+  await driverCommand(client, 'waitForAbsent', {
     ...finder,
-    timeout: String(timeout * 1000000),
+    timeout: msTimeout(timeout, 10),
   });
 }
 
 export async function vmGetText(client: DartVMClient, by: string, value: string, timeout?: number): Promise<string> {
   const finder = buildFinder(by, value);
 
-  const result = await client.callServiceExtension('ext.flutter.driver.getText', {
+  const response = await driverCommand(client, 'get_text', {
     ...finder,
-    timeout: String((timeout || 10) * 1000000),
-  }) as { text?: string };
+    timeout: msTimeout(timeout, 10),
+  });
 
-  return (result as any)?.text ?? '';
+  return typeof response.text === 'string' ? response.text : '';
 }
 
 export async function vmScreenshot(client: DartVMClient): Promise<Buffer> {
-  const result = await client.callServiceExtension('ext.flutter.driver.screenshot', {}) as { screenshot?: string };
+  // Screenshot is NOT a flutter_driver command — it's the VM's _flutter.screenshot.
+  const result = await client.callServiceExtension('_flutter.screenshot', {}) as { screenshot?: string };
   const base64 = (result as any)?.screenshot;
   if (!base64) throw new Error('VM screenshot returned empty');
   return Buffer.from(base64, 'base64');
@@ -128,9 +148,9 @@ export async function vmWaitForCondition(
   condition: 'NoPendingFrame' | 'FirstFrameRasterized' | 'NoPendingPlatformMessages' | 'CombinedCondition',
   timeout: number = 30,
 ): Promise<void> {
-  await client.callServiceExtension('ext.flutter.driver.waitForCondition', {
+  await driverCommand(client, 'waitForCondition', {
     conditionName: condition,
-    timeout: String(timeout * 1000000),
+    timeout: msTimeout(timeout, 30),
   });
 }
 

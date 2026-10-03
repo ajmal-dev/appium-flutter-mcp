@@ -1,5 +1,7 @@
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
 import { vmLogger as logger } from './vm-logger.js';
 
 // --- Types for Dart VM Service Protocol ---
@@ -125,9 +127,14 @@ export class DartVMClient extends EventEmitter {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private url: string = '';
   private availableExtensions: string[] = [];
+  private reconnectAttempts = 0;
+  private _reconnectedFrom: string | null = null;
 
   private static readonly REQUEST_TIMEOUT_MS = 15000;
   private static readonly RECONNECT_DELAY_MS = 3000;
+  // ~10 minutes of retries — covers a watchdog relaunch (app rebuild included)
+  // without spinning forever after a deliberate app shutdown.
+  private static readonly MAX_RECONNECT_ATTEMPTS = 200;
 
   get state(): DartVMClientState {
     return this._state;
@@ -179,6 +186,7 @@ export class DartVMClient extends EventEmitter {
         try {
           const result = await this.initialize();
           this._state = 'connected';
+          this.reconnectAttempts = 0;
           this.emit('stateChange', this._state);
           logger.info('Connected to Dart VM Service', {
             isolateId: result.isolateId,
@@ -202,6 +210,11 @@ export class DartVMClient extends EventEmitter {
         this._state = 'disconnected';
         this.emit('stateChange', this._state);
         this.cleanupPending('WebSocket closed');
+        // The dropped socket never told the VM server we unsubscribed, but on reconnect
+        // streamListen() would otherwise no-op (this Set still claims 'Extension' is
+        // subscribed) and the new socket would never actually resubscribe — silently
+        // killing flutter:navigation/flutter:frame forever after one dropped connection.
+        this.subscribedStreams.clear();
         if (wasConnected) {
           logger.warn('Dart VM Service connection closed');
           this.emit('disconnected');
@@ -244,18 +257,71 @@ export class DartVMClient extends EventEmitter {
     throw new Error('No Flutter isolate found. Is the app running in debug mode?');
   }
 
+  /** The URL currently (or last) connected to. */
+  get currentUrl(): string {
+    return this.url;
+  }
+
+  /** Set when an auto-reconnect switched to a fresh URL (app was relaunched). */
+  get reconnectedFrom(): string | null {
+    return this._reconnectedFrom;
+  }
+
+  /**
+   * The app-vm-watchdog (and app-up/preflight) publish the CURRENT debug
+   * build's VM URL to a file — default `.dart_vm_url` at the server's cwd,
+   * overridable via APPIUM_FLUTTER_VM_URL_FILE. When the app dies and is
+   * relaunched, the old URL is dead forever (new port + token); retrying it
+   * can never succeed. Re-resolving from the file is what closes the
+   * self-healing loop: watchdog relaunches → file changes → we follow.
+   */
+  private resolveFreshUrl(): string | null {
+    const file = process.env.APPIUM_FLUTTER_VM_URL_FILE ?? join(process.cwd(), '.dart_vm_url');
+    try {
+      if (!existsSync(file)) return null;
+      const raw = readFileSync(file, 'utf8').trim();
+      if (!raw) return null;
+      let u = raw.replace(/^http/, 'ws');
+      if (!u.startsWith('ws')) return null;
+      if (!u.endsWith('/ws')) u = u.replace(/\/+$/, '') + '/ws';
+      return u;
+    } catch {
+      return null;
+    }
+  }
+
   private scheduleReconnect() {
     if (this.reconnectTimer) return;
+    if (this.reconnectAttempts >= DartVMClient.MAX_RECONNECT_ATTEMPTS) {
+      logger.warn('Dart VM Service reconnect gave up', { attempts: this.reconnectAttempts });
+      return;
+    }
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      if (this._state === 'disconnected' && this.url) {
-        try {
-          await this.connect(this.url);
-          logger.info('Dart VM Service reconnected');
-          this.emit('reconnected');
-        } catch {
-          // Will schedule another reconnect on close
+      if (this._state === 'connected') return;
+      this.reconnectAttempts++;
+      // Prefer a fresh URL from the watchdog's file — a relaunched app never
+      // comes back on the old port/token.
+      const fresh = this.resolveFreshUrl();
+      const previous = this.url;
+      const target = fresh && fresh !== previous ? fresh : previous;
+      if (!target) return;
+      try {
+        if (target !== previous) {
+          logger.info('VM URL file points at a fresh URL (app relaunched) — switching', {
+            from: previous, to: target,
+          });
         }
+        await this.connect(target);
+        this._reconnectedFrom = target !== previous ? previous : null;
+        this.reconnectAttempts = 0;
+        logger.info('Dart VM Service reconnected', { url: target });
+        this.emit('reconnected');
+      } catch {
+        // A failed attempt used to kill the retry chain (close fires with
+        // wasConnected=false) — reschedule explicitly so the loop survives
+        // until the app is back or the attempt budget runs out.
+        this.scheduleReconnect();
       }
     }, DartVMClient.RECONNECT_DELAY_MS);
   }
@@ -425,10 +491,57 @@ export class DartVMClient extends EventEmitter {
   }
 
   async getRootWidgetSummaryTree(): Promise<WidgetSummaryNode> {
-    const result = await this.callServiceExtension(
-      'ext.flutter.inspector.getRootWidgetSummaryTree',
-      { objectGroup: this.groupName },
-    );
+    // Prefer the *WithPreviews variant: identical tree shape, but Text/RichText
+    // nodes carry `textPreview` — without it every button in the tree is an
+    // anonymous type name and the agent needs a screenshot to tell them apart.
+    // NOTE: WithPreviews expects `groupName` (NOT `objectGroup`) — verified live;
+    // passing objectGroup returns Server error -32000.
+    let result: unknown;
+    try {
+      result = await this.callServiceExtension(
+        'ext.flutter.inspector.getRootWidgetSummaryTreeWithPreviews',
+        { groupName: this.groupName },
+      );
+    } catch {
+      result = await this.callServiceExtension(
+        'ext.flutter.inspector.getRootWidgetSummaryTree',
+        { objectGroup: this.groupName },
+      );
+    }
+    const node = (result as any)?.result || result;
+    return node as WidgetSummaryNode;
+  }
+
+  /**
+   * Unfiltered widget tree — includes framework widgets (Text, RichText,
+   * EditableText, etc.) that the creation-location-filtered summary tree
+   * omits. Use this when verifying text/semanticsLabel locators against
+   * arbitrary widgets, not just user-code widgets.
+   *
+   * IMPORTANT — the newer `getRootWidgetTree` extension expects `groupName`
+   * (NOT `objectGroup`); passing the wrong key returns Server error -32000.
+   * `getRootWidget` (older) uses `objectGroup`. Try both shapes so the call
+   * works across Flutter versions.
+   */
+  async getRootWidget(objectGroup?: string): Promise<WidgetSummaryNode> {
+    const group = objectGroup ?? this.groupName;
+    let result: unknown;
+    try {
+      result = await this.callServiceExtension(
+        'ext.flutter.inspector.getRootWidgetTree',
+        {
+          groupName: group,
+          isSummaryTree: 'false',
+          withPreviews: 'true',
+          fullDetails: 'true',
+        },
+      );
+    } catch {
+      result = await this.callServiceExtension(
+        'ext.flutter.inspector.getRootWidget',
+        { objectGroup: group },
+      );
+    }
     const node = (result as any)?.result || result;
     return node as WidgetSummaryNode;
   }
@@ -462,6 +575,97 @@ export class DartVMClient extends EventEmitter {
         objectGroup: this.groupName,
       },
     );
+  }
+
+  /**
+   * Toggle on-device "select widget mode". When enabled, a physical tap on the
+   * device selects the widget under the finger and the inspector overlay
+   * highlights it. NOTE: the `enabled` arg is sent as a STRING per the inspector
+   * protocol, not a boolean — keep that quirk encapsulated here.
+   */
+  async setSelectMode(enabled: boolean, objectGroup?: string): Promise<void> {
+    await this.callServiceExtension('ext.flutter.inspector.show', {
+      enabled: enabled ? 'true' : 'false',
+      objectGroup: objectGroup ?? this.groupName,
+    });
+  }
+
+  /**
+   * Read the current on-device selection from the creation-location-filtered
+   * summary tree (user-code widgets only). Returns null when nothing is
+   * selected. Debug builds only — guard with hasExtension() before calling.
+   */
+  async getSelectedSummaryWidget(
+    objectGroup?: string,
+    previousSelectionId?: string,
+  ): Promise<WidgetSummaryNode | null> {
+    const result = await this.callServiceExtension(
+      'ext.flutter.inspector.getSelectedSummaryWidget',
+      {
+        objectGroup: objectGroup ?? this.groupName,
+        previousSelectionId: previousSelectionId ?? '',
+      },
+    );
+    const node = (result as any)?.result ?? result;
+    return node && (node as WidgetSummaryNode).valueId ? (node as WidgetSummaryNode) : null;
+  }
+
+  /**
+   * Full (unfiltered) current selection — includes framework wrapper widgets
+   * that have no creation location. Fallback when getSelectedSummaryWidget
+   * returns null.
+   */
+  async getSelectedWidget(
+    objectGroup?: string,
+    previousSelectionId?: string,
+  ): Promise<WidgetSummaryNode | null> {
+    const result = await this.callServiceExtension(
+      'ext.flutter.inspector.getSelectedWidget',
+      {
+        objectGroup: objectGroup ?? this.groupName,
+        previousSelectionId: previousSelectionId ?? '',
+      },
+    );
+    const node = (result as any)?.result ?? result;
+    return node && (node as WidgetSummaryNode).valueId ? (node as WidgetSummaryNode) : null;
+  }
+
+  /**
+   * Return the chain of nodes from the root down to the given widget. Each
+   * entry is `{ node, childIndex, children }`; `node` is a diagnostics node with
+   * a valueId scoped to `objectGroup`. Used to walk a widget's ancestors for
+   * scoped (descendant-axis) locator generation.
+   */
+  async getParentChain(valueId: string, objectGroup?: string): Promise<any[]> {
+    const result = await this.callServiceExtension(
+      'ext.flutter.inspector.getParentChain',
+      { arg: valueId, objectGroup: objectGroup ?? this.groupName },
+    );
+    const chain = (result as any)?.result ?? result;
+    return Array.isArray(chain) ? chain : [];
+  }
+
+  /**
+   * Fetch the creation-location summary tree under a specific object group.
+   * Uses the *WithPreviews variant so nodes carry textPreview (needed for
+   * text-based locator counting); falls back to the plain tree if unavailable.
+   */
+  async getRootWidgetSummaryTreeInGroup(objectGroup: string): Promise<WidgetSummaryNode> {
+    let result: unknown;
+    try {
+      // WithPreviews expects `groupName`, not `objectGroup` (verified live).
+      result = await this.callServiceExtension(
+        'ext.flutter.inspector.getRootWidgetSummaryTreeWithPreviews',
+        { groupName: objectGroup },
+      );
+    } catch {
+      result = await this.callServiceExtension(
+        'ext.flutter.inspector.getRootWidgetSummaryTree',
+        { objectGroup },
+      );
+    }
+    const node = (result as any)?.result || result;
+    return node as WidgetSummaryNode;
   }
 
   async getSemanticsTree(): Promise<unknown> {

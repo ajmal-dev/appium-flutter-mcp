@@ -1,30 +1,39 @@
 /**
- * MCP tool handlers for action recording.
+ * MCP tool handlers for test recording & generation.
  *
  * Tools:
  *  - start_recording   — begin capturing actions
- *  - stop_recording    — stop and return the recording (raw JSON action log)
+ *  - stop_recording    — stop and return the recording
  *  - add_assertion     — insert an assertion marker into the recording
+ *  - generate_test     — convert recorded actions to ZMA Java test code
  *  - get_recording     — peek at the current recording state
- *
- * The recorded JSON can be fed to your test framework of choice — this MCP
- * intentionally does not emit framework-specific code so it stays neutral.
  */
 
 import { z } from 'zod';
 import {
   startRecording, stopRecording, isRecording,
-  getActiveRecording, recordAssertion,
+  getActiveRecording, getLastRecording, recordAssertion,
 } from '../recording/recorder.js';
+import { generateTestScript } from '../recording/test-generator.js';
+import { scanProject } from '../project/scanner.js';
+import { loadConfig } from '../util/config.js';
 import { getSessionInfo } from '../appium/session.js';
 import type { McpToolResponse } from '../types.js';
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
 
 export const startRecordingSchema = z.object({
-  name: z.string().describe('Name for this recording session (e.g., "login_flow", "checkout")'),
+  name: z.string().describe('Name for this recording session (e.g., "login_flow", "appointment_booking")'),
+  testClassName: z.string().optional()
+    .describe('Java test class name to generate (e.g., "AppointmentBookingTests"). Auto-derived from name if omitted.'),
+  testMethodName: z.string().optional()
+    .describe('Java test method name (e.g., "testBookAppointment"). Auto-derived from name if omitted.'),
+  testGroups: z.array(z.string()).optional()
+    .describe('TestNG groups (e.g., ["Smoke", "E2E"]). Auto-inferred from actions if omitted.'),
+  packageName: z.string().optional()
+    .describe('Java package (default: com.zma.automation.tests)'),
   description: z.string().optional()
-    .describe('Free-form description stored alongside the recording.'),
+    .describe('Test description for the @Test annotation'),
 });
 
 export const stopRecordingSchema = z.object({});
@@ -48,6 +57,25 @@ export const addAssertionSchema = z.object({
     .describe('Value expression for assertNotNull'),
 });
 
+export const generateTestSchema = z.object({
+  testClassName: z.string().optional()
+    .describe('Override class name for generation'),
+  testMethodName: z.string().optional()
+    .describe('Override method name for generation'),
+  testGroups: z.array(z.string()).optional()
+    .describe('Override TestNG groups'),
+  packageName: z.string().optional()
+    .describe('Override Java package'),
+  description: z.string().optional()
+    .describe('Override test description'),
+  projectPath: z.string().optional()
+    .describe('Path to the automation project root. Used to scan existing page objects for reuse. If omitted, uses AUTOMATION_PROJECT_PATH from config.'),
+  export: z.boolean().optional().default(false)
+    .describe('Write the generated test class and page objects directly into the automation project (reuses existing page objects). Equivalent to the old export_to_project tool.'),
+  dryRun: z.boolean().optional().default(false)
+    .describe('With export=true: only scan the project and show what would be done without writing files.'),
+});
+
 export const getRecordingSchema = z.object({});
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -64,6 +92,10 @@ export async function handleStartRecording(
     } catch { /* no active session yet */ }
 
     const recording = startRecording(params.name, platform, {
+      testClassName: params.testClassName,
+      testMethodName: params.testMethodName,
+      testGroups: params.testGroups,
+      packageName: params.packageName,
       description: params.description,
     });
 
@@ -75,7 +107,7 @@ export async function handleStartRecording(
           id: recording.id,
           name: recording.name,
           platform: recording.platform,
-          message: 'Recording started. All tap, type_text, gesture, switch_context actions will be captured. Use "stop_recording" when done.',
+          message: `Recording started. All tap, type_text, gesture, switch_context actions will be captured. Use "stop_recording" when done, then "generate_test" to preview the Java test script, or "export_to_project" to generate and place files directly into your automation project.`,
         }, null, 2),
       }],
     };
@@ -114,7 +146,7 @@ export async function handleStopRecording(
             by: a.params.by || '',
             description: a.description || describeAction(a),
           })),
-          message: 'Recording stopped. The raw action log above can be saved or transformed into your test framework of choice.',
+          message: 'Recording stopped. Use "generate_test" to preview the script, or "export_to_project" to generate and place files directly into your automation project.',
         }, null, 2),
       }],
     };
@@ -173,6 +205,106 @@ export async function handleAddAssertion(
       }),
     }],
   };
+}
+
+export async function handleGenerateTest(
+  params: z.infer<typeof generateTestSchema>,
+): Promise<McpToolResponse> {
+  // Export mode (absorbed export_to_project): generate AND write into the project
+  if (params.export) {
+    const { handleExportToProject } = await import('./export.js');
+    return handleExportToProject({
+      projectPath: params.projectPath,
+      testClassName: params.testClassName,
+      testMethodName: params.testMethodName,
+      testGroups: params.testGroups,
+      packageName: params.packageName,
+      description: params.description,
+      dryRun: params.dryRun ?? false,
+    });
+  }
+
+  // Get active recording, or the last stopped recording
+  let recording = getActiveRecording();
+
+  // If there's an active recording, stop it first
+  if (recording && !recording.stoppedAt) {
+    recording = stopRecording();
+  }
+
+  // Fall back to last completed recording
+  if (!recording) {
+    recording = getLastRecording();
+  }
+
+  if (!recording) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: true,
+          message: 'No recording available. Start a recording with start_recording, perform actions, then stop_recording before generating.',
+        }),
+      }],
+    };
+  }
+
+  // Apply overrides
+  if (params.testClassName) recording.metadata.testClassName = params.testClassName;
+  if (params.testMethodName) recording.metadata.testMethodName = params.testMethodName;
+  if (params.testGroups) recording.metadata.testGroups = params.testGroups;
+  if (params.packageName) recording.metadata.packageName = params.packageName;
+  if (params.description) recording.metadata.description = params.description;
+
+  try {
+    // Scan project for existing page objects to reuse
+    const config = loadConfig();
+    const projectPath = params.projectPath || config.automationProjectPath;
+    let existingPages: import('../project/scanner.js').ExistingPageObject[] | undefined;
+    if (projectPath) {
+      try {
+        const project = scanProject(projectPath);
+        existingPages = project.pageObjects;
+      } catch { /* scan failed, generate without reuse */ }
+    }
+
+    const result = generateTestScript(recording, existingPages);
+
+    // Build combined output
+    const output: string[] = [];
+    output.push(result.summary);
+    output.push('');
+    output.push('---');
+    output.push('');
+    output.push(`### ${result.testClass.fileName}`);
+    output.push(`**Path**: \`${result.testClass.filePath}\``);
+    output.push('```java');
+    output.push(result.testClass.content);
+    output.push('```');
+
+    for (const po of result.pageObjects) {
+      output.push('');
+      output.push(`### ${po.fileName}`);
+      output.push(`**Path**: \`${po.filePath}\``);
+      output.push('```java');
+      output.push(po.content);
+      output.push('```');
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: output.join('\n'),
+      }],
+    };
+  } catch (error) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ error: true, message: `Generation failed: ${String(error)}` }),
+      }],
+    };
+  }
 }
 
 export async function handleGetRecording(

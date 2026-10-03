@@ -3,47 +3,56 @@ import { getBrowser, getCurrentPlatform } from '../appium/session.js';
 import { loadConfig } from '../util/config.js';
 import { logger } from '../util/logger.js';
 import { autoScan } from '../util/auto-scan.js';
+import { invalidateCache } from '../tree/tree-builder.js';
 import type { McpToolResponse } from '../types.js';
 
 export const launchAppSchema = z.object({
-  bundleId: z.string().optional().describe('iOS bundle ID (e.g., com.example.myapp). Falls back to APPIUM_BUNDLE_ID env when omitted.'),
-  appPackage: z.string().optional().describe('Android app package. Falls back to APPIUM_APP_PACKAGE env when omitted.'),
+  bundleId: z.string().optional().describe('iOS bundle ID (e.g., com.example.app)'),
+  appPackage: z.string().optional().describe('Android app package'),
   appActivity: z.string().optional().describe('Android app activity'),
 });
 
 export const terminateAppSchema = z.object({
-  bundleId: z.string().optional().describe('iOS bundle ID. Falls back to APPIUM_BUNDLE_ID env when omitted.'),
-  appPackage: z.string().optional().describe('Android app package. Falls back to APPIUM_APP_PACKAGE env when omitted.'),
+  bundleId: z.string().optional().describe('iOS bundle ID'),
+  appPackage: z.string().optional().describe('Android app package'),
 });
 
-export const deviceInfoSchema = z.object({});
+export const appControlSchema = z.object({
+  action: z.enum(['launch', 'terminate']).describe('"launch" activates the app (and auto-scans the screen); "terminate" kills it.'),
+  bundleId: z.string().optional().describe('iOS bundle ID. Defaults to APPIUM_BUNDLE_ID.'),
+  appPackage: z.string().optional().describe('Android app package'),
+  appActivity: z.string().optional().describe('Android app activity (launch only)'),
+});
+
+export async function handleAppControl(params: z.infer<typeof appControlSchema>): Promise<McpToolResponse> {
+  return params.action === 'launch'
+    ? handleLaunchApp(params)
+    : handleTerminateApp(params);
+}
 
 export async function handleLaunchApp(params: z.infer<typeof launchAppSchema>): Promise<McpToolResponse> {
   const browser = getBrowser();
   const platform = getCurrentPlatform();
-  const config = loadConfig();
 
   try {
     let appLabel: string;
     if (platform === 'ios') {
-      const bundleId = params.bundleId || config.bundleId;
-      if (!bundleId) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: true, message: 'No bundle ID provided. Pass bundleId or set APPIUM_BUNDLE_ID env.' }) }],
-        };
-      }
+      const bundleId = params.bundleId || loadConfig().bundleId;
+      if (!bundleId) throw new Error('Set bundleId or APPIUM_BUNDLE_ID before launching the app.');
       await browser.execute('mobile: activateApp', { bundleId });
       appLabel = bundleId;
     } else {
-      const pkg = params.appPackage || config.appPackage;
-      if (!pkg) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: true, message: 'No app package provided. Pass appPackage or set APPIUM_APP_PACKAGE env.' }) }],
-        };
+      const pkg = params.appPackage;
+      if (pkg) {
+        await browser.execute('mobile: activateApp', { appId: pkg });
       }
-      await browser.execute('mobile: activateApp', { appId: pkg });
-      appLabel = pkg;
+      appLabel = pkg || 'default';
     }
+
+    // Invalidate BEFORE autoScan — autoScan reads the page-source-scanner cache that
+    // invalidateCache() also clears; invalidating after would let the launch response's
+    // attached scan describe the previous (terminated) app state instead of the fresh one.
+    invalidateCache();
 
     // Auto-scan: return screen state so Claude knows what's on screen immediately
     const content: McpToolResponse['content'] = [
@@ -67,30 +76,24 @@ export async function handleLaunchApp(params: z.infer<typeof launchAppSchema>): 
 export async function handleTerminateApp(params: z.infer<typeof terminateAppSchema>): Promise<McpToolResponse> {
   const browser = getBrowser();
   const platform = getCurrentPlatform();
-  const config = loadConfig();
 
   try {
     if (platform === 'ios') {
-      const bundleId = params.bundleId || config.bundleId;
-      if (!bundleId) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: true, message: 'No bundle ID provided. Pass bundleId or set APPIUM_BUNDLE_ID env.' }) }],
-        };
-      }
+      const bundleId = params.bundleId || loadConfig().bundleId;
+      if (!bundleId) throw new Error('Set bundleId or APPIUM_BUNDLE_ID before terminating the app.');
       await browser.execute('mobile: terminateApp', { bundleId });
+      invalidateCache();
       return {
         content: [{ type: 'text' as const, text: `Terminated app: ${bundleId}` }],
       };
     } else {
-      const pkg = params.appPackage || config.appPackage;
-      if (!pkg) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: true, message: 'No app package provided. Pass appPackage or set APPIUM_APP_PACKAGE env.' }) }],
-        };
+      const pkg = params.appPackage;
+      if (pkg) {
+        await browser.execute('mobile: terminateApp', { appId: pkg });
       }
-      await browser.execute('mobile: terminateApp', { appId: pkg });
+      invalidateCache();
       return {
-        content: [{ type: 'text' as const, text: `Terminated app: ${pkg}` }],
+        content: [{ type: 'text' as const, text: `Terminated app: ${pkg || 'default'}` }],
       };
     }
   } catch (error) {

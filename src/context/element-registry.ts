@@ -13,6 +13,8 @@
 import { logger } from '../util/logger.js';
 import { enhancedSimilarity } from '../locator/fuzzy.js';
 
+import { matchesDistinctiveToken } from '../util/distinctive-tokens.js';
+
 export interface ContextRegion {
   contextId: string;
   contextType: 'flutter' | 'webview' | 'native';
@@ -134,6 +136,19 @@ class ElementRegistry {
       const value = fingerprint.slice(colonIdx + 1);
 
       const score = enhancedSimilarity(descLower, value.toLowerCase());
+
+      // Character similarity alone is unsafe against ValueKeys. Key strings are
+      // boilerplate-heavy ("apb_", "_button", "_day_"), so unrelated phrases
+      // score high: "book button" vs "apb_today_button" hits 0.90 and sails past
+      // the 0.8 threshold — a WRONG tap, taken before any scan runs because this
+      // is the fast path. Observed live 2026-08-01 (tapped Today instead of Book).
+      //
+      // Gate on a DISTINCTIVE token instead: at least one meaningful word from
+      // the description must actually appear in the locator value. "today
+      // button" -> {today}, present in apb_today_button (accept); "book button"
+      // -> {book}, absent (reject, fall through to the full scan).
+      if (!matchesDistinctiveToken(descLower, value)) continue;
+
       if (score > (best?.score ?? threshold)) {
         // Verify context still exists
         if (this.knownContextIds.length > 0 && !this.knownContextIds.includes(entry.contextId)) {

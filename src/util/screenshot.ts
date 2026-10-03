@@ -7,12 +7,21 @@ export interface ScreenshotResult {
 }
 
 /**
+ * Default compression applied to screenshots that are returned to the LLM.
+ * A raw iPad PNG (~2000px wide) costs ~3,700 image tokens per shot; resampled
+ * to 800px JPEG it costs ~600 — with no loss of usefulness for element
+ * identification. Coordinate-based reasoning must scale by the device dims
+ * echoed in the accompanying text (or use { raw: true }).
+ */
+export const LLM_SCREENSHOT_OPTS = { maxWidth: 800, quality: 75 } as const;
+
+/**
  * Capture screenshot and optionally compress for LLM token efficiency.
  * Uses macOS `sips` for JPEG conversion when available, falls back to raw PNG.
  *
- * Pass { raw: true } to skip compression entirely — needed by the CUA agent
- * because it reasons in the image's pixel space and Appium consumes those
- * same pixel coordinates back. Resizing would break the round-trip.
+ * Pass { raw: true } to skip compression entirely — needed when the agent
+ * reasons in the image's pixel space and Appium consumes those same pixel
+ * coordinates back. Resizing would break the round-trip.
  */
 export async function captureScreenshot(
   browser: Browser,

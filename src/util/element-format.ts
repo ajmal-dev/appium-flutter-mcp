@@ -22,8 +22,13 @@ export function formatElementsCompact(elements: InteractiveElement[]): string {
     if (el.key) {
       parts.push(`key:${el.key}`);
     }
-    // Show locator if it's not already the key (avoid duplication)
-    if (el.locator && !(el.key && el.locator.by === 'key' && el.locator.value === el.key)) {
+    // Show locator unless it duplicates the key OR merely restates the type
+    // (`InkWell type:InkWell` says nothing — the tap fallback is type+index anyway)
+    if (
+      el.locator &&
+      !(el.key && el.locator.by === 'key' && el.locator.value === el.key) &&
+      !(el.locator.by === 'type' && el.locator.value === el.type)
+    ) {
       parts.push(`${el.locator.by}:${el.locator.value}`);
     }
     if (el.position) {

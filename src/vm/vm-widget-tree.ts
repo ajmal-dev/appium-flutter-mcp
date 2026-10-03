@@ -8,7 +8,6 @@ import { vmLogger as logger } from './vm-logger.js';
 export interface VMWidgetNode extends WidgetNode {
   valueId?: string;
   creationLocation?: { file: string; line: number; column?: number };
-  semanticsLabel?: string;
   allLocators: LocatorCandidate[];
   sourceContext?: {
     filePath: string;
@@ -165,7 +164,7 @@ export async function enrichPositionsFromDetails(
   }
 }
 
-function extractPositionFromDetails(details: DetailedNode): { x: number; y: number; width: number; height: number } | null {
+export function extractPositionFromDetails(details: DetailedNode): { x: number; y: number; width: number; height: number } | null {
   if (!details.properties) return null;
 
   for (const prop of details.properties) {
@@ -218,6 +217,55 @@ export function condenseTree(node: VMWidgetNode): VMWidgetNode | null {
     ...node,
     children: condensedChildren.length > 0 ? condensedChildren : undefined,
   };
+}
+
+// --- Label propagation --------------------------------------------------------
+// Interactive widgets (GestureDetector, InkWell, buttons) rarely carry text
+// themselves — the label lives on a descendant Text/Icon widget. Without
+// propagation the element list reads "#4 Button … #10 Button"
+// and the agent must take a screenshot just to tell buttons apart. Lift the
+// shallowest descendant text/semanticsLabel onto each unlabeled interactive
+// node (display-only: locator candidates were already built from own-node data).
+
+const MAX_LABEL_LEN = 60;
+const MAX_LABEL_SCAN_NODES = 80;
+// A real control's label sits within a few composition levels. A deep-only
+// match means this "interactive" node is actually a page-level container
+// (e.g. the root GestureDetector) — labeling it with some faraway text is
+// actively misleading.
+const MAX_LABEL_DEPTH = 6;
+
+export function propagateDescendantLabels(node: VMWidgetNode): void {
+  if (node.interactive && !node.text && !node.semanticsLabel) {
+    const label = findDescendantLabel(node);
+    if (label) node.text = label;
+  }
+  if (node.children) {
+    for (const child of node.children as VMWidgetNode[]) {
+      propagateDescendantLabels(child);
+    }
+  }
+}
+
+function findDescendantLabel(node: VMWidgetNode): string | undefined {
+  // Depth-bounded BFS — the shallowest text wins (a card's own title beats a
+  // nested button's label). Bounded scan keeps this O(1)-ish on giant subtrees.
+  const queue: Array<{ n: VMWidgetNode; depth: number }> =
+    (node.children as VMWidgetNode[] ?? []).map(c => ({ n: c, depth: 1 }));
+  let visited = 0;
+  while (queue.length > 0 && visited < MAX_LABEL_SCAN_NODES) {
+    const { n, depth } = queue.shift()!;
+    visited++;
+    // Strip object-replacement chars leaked by RichText inline spans.
+    const label = (n.text || n.semanticsLabel || '').replace(/￼/g, '').trim();
+    if (label) {
+      return label.length > MAX_LABEL_LEN ? `${label.slice(0, MAX_LABEL_LEN)}…` : label;
+    }
+    if (n.children && depth < MAX_LABEL_DEPTH) {
+      queue.push(...(n.children as VMWidgetNode[]).map(c => ({ n: c, depth: depth + 1 })));
+    }
+  }
+  return undefined;
 }
 
 // --- Collect Interactive Elements ---
@@ -300,8 +348,7 @@ function buildLocators(
 // --- Key Extraction ---
 
 function extractKey(node: WidgetSummaryNode): string | undefined {
-  if (!node.properties) return undefined;
-  for (const prop of node.properties) {
+  for (const prop of node.properties ?? []) {
     if (prop.name === 'key' && prop.description) {
       const valueKeyMatch = prop.description.match(/(?:ValueKey|Key)\S*\(\s*'([^']+)'\s*\)/);
       if (valueKeyMatch) return valueKeyMatch[1];
@@ -313,6 +360,12 @@ function extractKey(node: WidgetSummaryNode): string | undefined {
         return prop.description.replace(/^\[<|'|>\]$/g, '').trim();
       }
     }
+  }
+  // Summary-tree nodes carry no `properties`; the ValueKey is encoded in the
+  // node description instead, e.g. `Text-[<'bryntum_appt_label_guest_name'>]`.
+  if (node.description) {
+    const m = node.description.match(/\[<'([^']+)'>\]/);
+    if (m) return m[1];
   }
   return undefined;
 }
@@ -371,6 +424,10 @@ export async function buildVMWidgetTree(client: DartVMClient, platform: string):
 
   const condensed = condenseTree(tree);
   if (condensed) tree = condensed;
+
+  // Lift descendant Text labels onto unlabeled interactive nodes so the
+  // element list is self-describing (locators are unaffected — built earlier).
+  propagateDescendantLabels(tree);
 
   const interactiveElements = collectInteractiveElements(tree);
 

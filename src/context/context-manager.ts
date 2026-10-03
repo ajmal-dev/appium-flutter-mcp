@@ -23,10 +23,25 @@ export function invalidateContextCache(): void {
   cachedContext = null;
 }
 
+// --- `mobile: getContexts` metadata TTL cache ---
+// This is the EXPENSIVE probe: unlike browser.getContexts() (a plain context-id
+// list), `mobile: getContexts` makes the WebKit remote debugger enumerate every
+// webview for url+title, bounded by webviewAtomWaitTimeout (20s). Both
+// findWebViewContextByUrl() and getWebViewMetadata() called it raw on every
+// invocation, so one smart-tap WebView fallback could pay it repeatedly.
+// Short TTL because a webview's URL can change without the context list
+// changing (SPA navigation) — 3s keeps a fallback scan cheap without serving
+// a meaningfully stale URL.
+let cachedWebViewMeta: WebViewMeta[] | null = null;
+let webViewMetaCacheTime: number = 0;
+const WEBVIEW_META_CACHE_TTL_MS = 3000;
+
 /** Invalidate the getContexts() cache (call when contexts may have changed, e.g. navigation) */
 export function invalidateContextsListCache(): void {
   cachedContextsList = null;
   contextsCacheTime = 0;
+  cachedWebViewMeta = null;
+  webViewMetaCacheTime = 0;
 }
 
 /**
@@ -100,6 +115,7 @@ export async function switchToFlutter(): Promise<string> {
 /**
  * Find a WEBVIEW context ID by URL using full context metadata from 'mobile: getContexts'.
  * Does NOT switch contexts — reads URL/title metadata directly.
+ * Based on zmauiautomation's findWebViewContextByUrl pattern.
  *
  * @param urlFragment substring to match in the webview URL (e.g. "/appointmentbook")
  * @param excludeIds optional set of webview IDs to ignore (used to skip stale "about:blank" preloaded contexts when waiting for a NEW webview to appear)
@@ -107,32 +123,70 @@ export async function switchToFlutter(): Promise<string> {
  */
 export async function findWebViewContextByUrl(urlFragment: string, excludeIds?: ReadonlySet<string>): Promise<string | null> {
   try {
-    const browser = getBrowser();
-    const result: unknown = await browser.executeScript('mobile: getContexts', []);
+    // excludeIds means the caller is POLLING for a webview that doesn't exist
+    // yet (waitForNew). Serving a cached list there would loop forever on stale
+    // data, so force a fresh probe in that case only.
+    const metas = await getWebViewMetadata({ forceRefresh: !!excludeIds });
 
-    if (!Array.isArray(result)) return null;
-
-    for (const item of result) {
-      if (item && typeof item === 'object') {
-        const ctx = item as Record<string, unknown>;
-        const id = ctx.id != null ? String(ctx.id) : null;
-        const url = ctx.url != null ? String(ctx.url) : '';
-        const title = ctx.title != null ? String(ctx.title) : '';
-
-        if (id && id.includes('WEBVIEW')) {
-          logger.debug('Context metadata', { id, title, url: url.length > 80 ? url.substring(0, 80) + '...' : url });
-
-          if (excludeIds && excludeIds.has(id)) continue;
-          if (url.includes(urlFragment)) {
-            return id;
-          }
-        }
+    for (const { id, url, title } of metas) {
+      logger.debug('Context metadata', { id, title, url: url.length > 80 ? url.substring(0, 80) + '...' : url });
+      if (excludeIds && excludeIds.has(id)) continue;
+      if (url.includes(urlFragment)) {
+        return id;
       }
     }
   } catch (e) {
     logger.warn('fullContextList lookup failed, will use fallback', { error: String(e) });
   }
   return null;
+}
+
+export interface WebViewMeta {
+  id: string;
+  url: string;
+  title: string;
+}
+
+/**
+ * Fetch id+url+title for every WEBVIEW context in ONE `mobile: getContexts`
+ * call. Lets callers rank/skip webviews by metadata instead of trial-switching
+ * into them (blind switches into stale about:blank preloads can hang the
+ * WebKit remote debugger or crash the session on iOS).
+ */
+export async function getWebViewMetadata(options?: { forceRefresh?: boolean }): Promise<WebViewMeta[]> {
+  if (!options?.forceRefresh
+      && cachedWebViewMeta
+      && (Date.now() - webViewMetaCacheTime) < WEBVIEW_META_CACHE_TTL_MS) {
+    return cachedWebViewMeta;
+  }
+  try {
+    const browser = getBrowser();
+    const result: unknown = await browser.executeScript('mobile: getContexts', []);
+    if (!Array.isArray(result)) return [];
+    const metas: WebViewMeta[] = [];
+    for (const item of result) {
+      if (!item || typeof item !== 'object') continue;
+      const ctx = item as Record<string, unknown>;
+      const id = ctx.id != null ? String(ctx.id) : null;
+      if (!id || !id.includes('WEBVIEW')) continue;
+      metas.push({
+        id,
+        url: ctx.url != null ? String(ctx.url) : '',
+        title: ctx.title != null ? String(ctx.title) : '',
+      });
+    }
+    cachedWebViewMeta = metas;
+    webViewMetaCacheTime = Date.now();
+    return metas;
+  } catch (e) {
+    logger.debug('getWebViewMetadata failed', { error: String(e) });
+    return [];
+  }
+}
+
+/** A webview with a real page loaded (not a blank preload placeholder). */
+function hasRealUrl(meta: WebViewMeta): boolean {
+  return meta.url !== '' && meta.url !== 'about:blank';
 }
 
 /**
@@ -153,8 +207,9 @@ export async function snapshotWebViewIds(): Promise<Set<string>> {
 
 /**
  * Poll for a webview whose URL matches `urlFragment` and whose context ID is NOT
- * present in `excludeIds`. Useful for hybrid forms where multiple webviews coexist
- * and an old "about:blank" preloaded context is still around.
+ * present in `excludeIds`. Mirrors zmauiautomation's "wait for NEW form webview"
+ * pattern — essential for hybrid forms where multiple webviews coexist and an
+ * old "about:blank" preloaded context is still around.
  *
  * Does NOT switch — returns the matched ID. Caller decides when to switch.
  */
@@ -184,7 +239,8 @@ export async function waitForNewWebViewByUrl(args: {
 /**
  * Once switched into a WebView, poll a small JS predicate until it returns truthy
  * (or a JSON-safe primitive truthy value). Used after switching to a form webview
- * to wait for actual content to render.
+ * to wait for actual content to render — mirrors zmauiautomation's
+ * `waitForGuestFormReady()` second phase.
  *
  * Default predicate: `document.readyState === 'complete' && document.body && document.body.children.length > 0`.
  * Pass `predicateJs` like `"document.querySelectorAll('input').length > 0"` for forms.
@@ -222,6 +278,7 @@ export async function waitForWebViewContentReady(args?: {
 /**
  * Switch to a specific WEBVIEW context whose URL contains the given fragment.
  * Uses mobile: getContexts metadata to find the right context WITHOUT switching to wrong ones.
+ * Based on zmauiautomation's switchToWebViewByUrl pattern.
  *
  * @param urlFragment substring to match against the webview URL (e.g. "/appointmentbook")
  * @param waitTimeout seconds to wait for the webview to appear
@@ -259,11 +316,24 @@ export async function switchToWebView(waitTimeout: number = 10, webviewId?: stri
   while (Date.now() < deadline) {
     // Force fresh fetch when actively waiting for a WebView to appear
     invalidateContextsListCache();
-    const contexts = await getContexts();
-    const webviews = contexts.filter(c => c.startsWith('WEBVIEW'));
+
+    // Rank candidates by METADATA before touching any of them: real-URL
+    // webviews first (newest last→first), about:blank preloads dead last —
+    // switching into a stale preload wastes a WebKit handshake and can hang.
+    const metas = await getWebViewMetadata();
+    let webviews: string[];
+    if (metas.length > 0) {
+      const real = metas.filter(hasRealUrl).map(m => m.id).reverse();
+      const blank = metas.filter(m => !hasRealUrl(m)).map(m => m.id);
+      webviews = [...real, ...blank];
+    } else {
+      // Metadata unavailable (older drivers) — fall back to bare context ids
+      const contexts = await getContexts();
+      webviews = contexts.filter(c => c.startsWith('WEBVIEW')).reverse();
+    }
 
     if (webviews.length > 0) {
-      // Build ordered list of webviews to try
+      // Build ordered list of webviews to try (preserving the metadata ranking)
       let targets: string[];
       if (webviewId) {
         // Exact match first, then fall back to others
@@ -272,8 +342,7 @@ export async function switchToWebView(waitTimeout: number = 10, webviewId?: stri
       } else if (lastActiveWebView && webviews.includes(lastActiveWebView)) {
         targets = [lastActiveWebView, ...webviews.filter(w => w !== lastActiveWebView)];
       } else {
-        // Try newest (last) first, then others
-        targets = [...webviews].reverse();
+        targets = [...webviews];
       }
 
       // Try each webview context — some may crash the session on iOS with FlutterIntegration

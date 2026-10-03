@@ -1,5 +1,5 @@
 import { getBrowser } from '../appium/session.js';
-import { getCurrentContext, switchToWebView, switchToNative, getWebViewContexts } from './context-manager.js';
+import { getCurrentContext, switchToWebView, switchToNative, getWebViewMetadata } from './context-manager.js';
 import { logger } from '../util/logger.js';
 
 export async function getPageSource(): Promise<string> {
@@ -25,13 +25,14 @@ export async function getPageSource(): Promise<string> {
 /**
  * Execute JavaScript in a WebView context.
  * Auto-wraps scripts that don't contain 'return' with a return statement.
- * If multiple WebViews exist and the script fails in one, tries the others.
+ * If the current webview fails, retries ONLY across webviews with a real page
+ * loaded (about:blank preloads are skipped — running the script there returns
+ * misleading empty results), and reports which context actually executed it.
  */
-export async function executeJavaScript(script: string): Promise<unknown> {
+export async function executeJavaScript(script: string): Promise<{ result: unknown; context: string }> {
   const browser = getBrowser();
   const ctx = await getCurrentContext();
   const wasWebView = ctx.startsWith('WEBVIEW');
-  const originalContext = ctx;
 
   if (!wasWebView) {
     await switchToWebView(10);
@@ -42,19 +43,21 @@ export async function executeJavaScript(script: string): Promise<unknown> {
 
   try {
     const result = await browser.execute(wrappedScript);
-    return result;
+    return { result, context: await getCurrentContext() };
   } catch (firstError) {
-    // If we're in a webview and it failed, try other webviews
-    const webviews = await getWebViewContexts();
+    // If we're in a webview and it failed, try other REAL-page webviews
+    const metas = await getWebViewMetadata();
     const currentWv = await getCurrentContext();
+    const candidates = metas
+      .filter(m => m.id !== currentWv && m.url && m.url !== 'about:blank')
+      .map(m => m.id);
 
-    for (const wv of webviews) {
-      if (wv === currentWv) continue;
+    for (const wv of candidates) {
       try {
         await browser.switchContext(wv);
         const result = await browser.execute(wrappedScript);
         logger.info('JS executed successfully in alternate WebView', { context: wv });
-        return result;
+        return { result, context: wv };
       } catch {
         // Try next
       }

@@ -1,16 +1,26 @@
 import { z } from 'zod';
 import { McpToolResponse } from '../types.js';
 import { logger } from '../util/logger.js';
-import { getBrowserWithReconnect } from '../appium/session.js';
+import { getBrowserWithReconnect, getSessionMode } from '../appium/session.js';
 import { pageSourceScan, scanWebViewInteractiveElements } from '../tree/page-source-scanner.js';
+import { getScreenElements } from '../util/element-source.js';
 import { getNativeInteractiveElements } from '../context/native-inspector.js';
 import { enhancedSimilarity } from '../locator/fuzzy.js';
 import { getRegistry } from '../context/element-registry.js';
-import { getWebViewContexts, ensureContextForLocator } from '../context/context-manager.js';
+import { getWebViewContexts, ensureContextForLocator, getContexts } from '../context/context-manager.js';
 import { formatElementsCompact } from '../util/element-format.js';
+import {
+  buildFinder, buildWebFinder, buildNativeFinder,
+  strategyPrefix, toConstantName,
+} from '../recording/test-generator.js';
 import { getDartSourceIndex, searchValueKeys } from '../source/dart-source-scanner.js';
 import { loadConfig } from '../util/config.js';
 import type { InteractiveElement } from '../tree/types.js';
+import { applyHybridHeuristics, buildParentScopedJava } from '../agent/locator-playbook.js';
+import {
+  getCurrentAppId, getCachedLocator, cacheResolvedLocator,
+  recordScreen,
+} from '../context/screen-map-store.js';
 
 // ── Schema ───────────────────────────────────────────────────────────────────
 
@@ -36,7 +46,7 @@ const TYPE_HINT_MAP: Record<string, Set<string>> = {
   checkbox: new Set(['Checkbox']),
   dropdown: new Set(['DropdownButton', 'DropdownMenu', 'PopupMenuButton']),
   tab: new Set(['Tab']),
-  card: new Set(['ListTile', 'Card']),
+  card: new Set(['Card', 'ListTile', 'AppointmentCard', 'GuestCard', 'ServiceCard']),
   icon: new Set(['Icon', 'IconButton', 'ImageIcon']),
   search: new Set(['SearchBar', 'SearchAnchor']),
 };
@@ -48,6 +58,21 @@ export async function handleFlutterLocator(
 ): Promise<McpToolResponse> {
   const { description, topN, context: searchContext, mode, verify } = params;
   const clampedTopN = Math.max(1, Math.min(5, topN));
+
+  // Flutter-mode guard — this tool is built around the Flutter widget tree and
+  // Dart source ValueKey index; Safari / native sessions have neither.
+  const sessionMode = getSessionMode();
+  if (sessionMode !== 'flutter') {
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `flutter_locator is Flutter-only (current sessionMode = "${sessionMode}"). ` +
+          (sessionMode === 'safari'
+            ? 'For Safari, describe the element and use inspect(target:"webview") to see DOM CSS selectors, then tap(by:"css",value:"...").'
+            : 'For native XCUITest, use inspect(target:"native") to see accessibility IDs and XPaths.'),
+      }],
+    };
+  }
 
   // Ensure we have an active session
   try {
@@ -73,7 +98,47 @@ export async function handleFlutterLocator(
     return { content: [{ type: 'text', text: output }] };
   }
 
-  // 2. Scan screen based on context
+  // 2. Per-screen locator cache: fast-path for known screens
+  //    One screen scan is needed anyway; we reuse it for fingerprinting.
+  //    NOTE: this now sources from the key-aware VM tree when available, so
+  //    fingerprints include real ValueKeys — better identity than the old
+  //    text/type-only ones, at the cost of re-learning previously mapped
+  //    screens once (existing entries stop matching and are re-recorded).
+  let cachedElements: InteractiveElement[] | null = null;
+  let screenIdForCache: string | null = null;
+
+  if (searchContext !== 'native' && searchContext !== 'webview') {
+    try {
+      const appId = getCurrentAppId();
+      if (appId) {
+        const { elements: scanned } = await getScreenElements();
+        // Upsert via structural identity — same logical screen with different
+        // data resolves to the same entry, so the cache survives data changes.
+        const entry = recordScreen(appId, scanned);
+        screenIdForCache = entry?.screenId ?? null;
+
+        const cached = screenIdForCache ? getCachedLocator(appId, screenIdForCache, description) : null;
+        if (cached && mode !== 'structured') {
+          logger.debug('flutter_locator: screen-cache hit', { description, screenId: screenIdForCache, by: cached.by, value: cached.value });
+          const output = formatSingleLocator({
+            by: cached.by,
+            value: cached.value,
+            contextType: cached.contextType,
+            score: 1.0,
+            element: null,
+            unique: cached.matchCount === 1,
+          }, description);
+          return { content: [{ type: 'text', text: output + '\n[source: screen-cache]' }] };
+        }
+        // Reuse the already-scanned elements so we don't double-scan below
+        cachedElements = scanned;
+      }
+    } catch (e) {
+      logger.debug('flutter_locator: screen-cache probe failed (non-critical)', { error: String(e) });
+    }
+  }
+
+  // 3. Scan screen based on context
   let elements: InteractiveElement[] = [];
 
   if (searchContext === 'native') {
@@ -85,8 +150,8 @@ export async function handleFlutterLocator(
     elements = await scanAllWebViews(0);
 
   } else {
-    // 'flutter' or 'auto': start with pageSourceScan
-    elements = await pageSourceScan();
+    // 'flutter' or 'auto': reuse elements from the cache probe (already scanned) or do a fresh scan
+    elements = cachedElements ?? (await getScreenElements()).elements;
 
     // 'auto' fallback: if weak Flutter match, try WebView then Native
     if (searchContext === 'auto') {
@@ -156,7 +221,7 @@ export async function handleFlutterLocator(
 
   // ── Structured mode: return rich JSON for AI analysis ──────────────────────
   if (mode === 'structured') {
-    return buildStructuredOutput(description, matches[0], elements, verify);
+    return buildStructuredOutput(description, matches[0], elements, verify, screenIdForCache);
   }
 
   // ── Human mode: existing readable output ───────────────────────────────────
@@ -198,6 +263,33 @@ export async function handleFlutterLocator(
     lines.push('Java:');
     lines.push(`  private static final String ${constName} = "${escapeJava(locator.value)}";`);
     lines.push(`  // Usage: ${javaUsage}`);
+
+    // Hybrid hint: when the locator isn't unique, suggest scoping under the
+    // closest parent ValueKey so the call resolves to exactly one element.
+    if (!locator.unique && contextType === 'flutter') {
+      const parentKeys = findParentKeys(element, elements);
+      if (parentKeys.length > 0) {
+        lines.push('');
+        lines.push(`Non-unique (${locator.duplicateCount} matches). Scope under parent "${parentKeys[0]}":`);
+        lines.push('```java');
+        lines.push(buildParentScopedJava(parentKeys[0], locator.by, locator.value));
+        lines.push('```');
+      }
+    }
+
+    // Persist the best (first) match to the screen-locator cache for future fast-path reuse
+    if (i === 0 && locator.unique && screenIdForCache) {
+      const appId = getCurrentAppId();
+      if (appId) {
+        cacheResolvedLocator(appId, screenIdForCache, description, {
+          by: locator.by,
+          value: locator.value,
+          matchCount: locator.duplicateCount,
+          contextType: contextType as 'flutter' | 'webview' | 'native',
+        });
+        logger.debug('flutter_locator: screen-cache populated', { description, by: locator.by, value: locator.value });
+      }
+    }
 
     if (i < matches.length - 1) lines.push('\n---\n');
   }
@@ -419,6 +511,8 @@ interface StructuredLocatorResult {
     verified?: boolean;
     matchCount?: number;
     javaCode: string;
+    unsupported?: boolean;
+    unsupportedReason?: string;
   }>;
   parentKeys: string[];
   sourceInfo?: {
@@ -429,6 +523,10 @@ interface StructuredLocatorResult {
   };
   sourceHint?: string;
   allElementsSummary: string;
+  /** Advisory notes from the hybrid-locator heuristic (see locator-playbook.ts). */
+  notes?: string[];
+  /** Java snippet scoping the chosen locator under the nearest parent ValueKey, when matchCount > 1. */
+  parentScopedJavaCode?: string;
 }
 
 const APPIUM_STRATEGIES: Record<string, string> = {
@@ -446,6 +544,7 @@ async function buildStructuredOutput(
   match: ScoredMatch,
   allElements: InteractiveElement[],
   verify: boolean,
+  screenIdForCache: string | null = null,
 ): Promise<McpToolResponse> {
   const { element, score } = match;
   const contextType = detectContextType(element.context);
@@ -464,7 +563,17 @@ async function buildStructuredOutput(
     });
   }
 
-  // Priority 2: semanticsLabel
+  // Priority 2: text
+  if (element.text) {
+    candidates.push({
+      by: 'text',
+      value: element.text,
+      priority: ++priority,
+      javaCode: buildJavaCode('text', element.text, contextType),
+    });
+  }
+
+  // Priority 3: semanticsLabel
   const semLabel = element.locator?.by === 'semanticsLabel' ? element.locator.value : undefined;
   if (semLabel) {
     candidates.push({
@@ -472,16 +581,6 @@ async function buildStructuredOutput(
       value: semLabel,
       priority: ++priority,
       javaCode: buildJavaCode('semanticsLabel', semLabel, contextType),
-    });
-  }
-
-  // Priority 3: text
-  if (element.text) {
-    candidates.push({
-      by: 'text',
-      value: element.text,
-      priority: ++priority,
-      javaCode: buildJavaCode('text', element.text, contextType),
     });
   }
 
@@ -525,6 +624,17 @@ async function buildStructuredOutput(
   // Find parent keys (for descendant axis)
   const parentKeys = findParentKeys(element, allElements);
 
+  // Hybrid-locator heuristics: mark blocked framework type locators as
+  // unsupported, surface notes for icon-only widgets, and emit a
+  // parent-scoping Java snippet when the best candidate is non-unique.
+  const heuristic = applyHybridHeuristics({
+    candidates,
+    elementText: element.text,
+    semanticsLabel: semLabel,
+    parentKeys,
+    contextType,
+  });
+
   // Get source info
   const sourceInfo = await getSourceInfoStructured(element.key || element.locator?.value);
 
@@ -543,7 +653,24 @@ async function buildStructuredOutput(
     parentKeys,
     sourceInfo: sourceInfo || undefined,
     allElementsSummary: formatElementsCompact(allElements.slice(0, 20)),
+    notes: heuristic.notes.length ? heuristic.notes : undefined,
+    parentScopedJavaCode: heuristic.parentScopedJavaCode,
   };
+
+  // Persist the best unique verified candidate to the screen-locator cache
+  if (screenIdForCache) {
+    const appId = getCurrentAppId();
+    const bestVerified = candidates.find(c => c.verified && c.matchCount === 1);
+    if (appId && bestVerified) {
+      cacheResolvedLocator(appId, screenIdForCache, description, {
+        by: bestVerified.by,
+        value: bestVerified.value,
+        matchCount: bestVerified.matchCount ?? 1,
+        contextType,
+      });
+      logger.debug('flutter_locator: screen-cache populated (structured)', { description, by: bestVerified.by });
+    }
+  }
 
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }
@@ -582,6 +709,11 @@ async function verifyCandidates(
   } catch {
     return; // Can't verify without browser
   }
+
+  // Prime the getContexts() cache once before the verify loop so all
+  // ensureContextForLocator() calls within this batch hit the 5s TTL cache
+  // instead of each potentially paying the 100-500ms Appium round-trip.
+  await getContexts().catch(() => {});
 
   for (const c of candidates) {
     const strategy = APPIUM_STRATEGIES[c.by];
@@ -693,57 +825,5 @@ async function getSourceKeyInfo(keyValue: string): Promise<string | null> {
     return `${shortPath}:${def.line}`;
   } catch {
     return null;
-  }
-}
-
-// ── Java locator formatting helpers ───────────────────────────────────────
-//
-// These produce neutral Java snippets aimed at the appium-flutter-integration
-// driver's `FlutterBy` finder for Flutter contexts and `AppiumBy` / `By` for
-// native/webview contexts. Adjust to your own helper class if needed.
-
-export function strategyPrefix(by: string): string {
-  switch (by) {
-    case 'key':            return 'KEY_';
-    case 'text':           return 'TEXT_';
-    case 'type':           return 'TYPE_';
-    case 'semanticsLabel': return 'LABEL_';
-    case 'xpath':          return 'XPATH_';
-    case 'accessibilityId':return 'ACC_';
-    case 'css':            return 'CSS_';
-    default:               return 'LOC_';
-  }
-}
-
-export function toConstantName(value: string): string {
-  return value
-    .replace(/[^A-Za-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .toUpperCase() || 'X';
-}
-
-export function buildFinder(by: string, constName: string): string {
-  switch (by) {
-    case 'key':            return `driver.findElement(FlutterBy.valueKey(${constName}))`;
-    case 'text':           return `driver.findElement(FlutterBy.text(${constName}))`;
-    case 'type':           return `driver.findElement(FlutterBy.type(${constName}))`;
-    case 'semanticsLabel': return `driver.findElement(FlutterBy.semanticsLabel(${constName}))`;
-    default:               return `driver.findElement(FlutterBy.${by}(${constName}))`;
-  }
-}
-
-export function buildNativeFinder(by: string, constName: string): string {
-  switch (by) {
-    case 'xpath':           return `driver.findElement(AppiumBy.xpath(${constName}))`;
-    case 'accessibilityId': return `driver.findElement(AppiumBy.accessibilityId(${constName}))`;
-    default:                return `driver.findElement(AppiumBy.${by}(${constName}))`;
-  }
-}
-
-export function buildWebFinder(by: string, constName: string): string {
-  switch (by) {
-    case 'css':   return `driver.findElement(By.cssSelector(${constName}))`;
-    case 'xpath': return `driver.findElement(By.xpath(${constName}))`;
-    default:      return `driver.findElement(By.${by}(${constName}))`;
   }
 }

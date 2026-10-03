@@ -453,25 +453,47 @@ const INTERACTIVE_INPUT_TYPES = new Set([
  * @param contextId - The WEBVIEW_xxx context to scan
  * @param startIndex - Starting index for element numbering (to continue from native scan)
  */
+export interface WebViewScanResult {
+  elements: InteractiveElement[];
+  /** Total visible matches in the DOM (may exceed elements.length when truncated). */
+  total: number;
+  truncated: boolean;
+}
+
 export async function scanWebViewInteractiveElements(
   contextId: string,
   startIndex: number = 0,
+  opts?: { selector?: string; timeoutMs?: number },
 ): Promise<InteractiveElement[]> {
+  return (await scanWebViewInteractiveElementsDetailed(contextId, startIndex, opts)).elements;
+}
+
+export async function scanWebViewInteractiveElementsDetailed(
+  contextId: string,
+  startIndex: number = 0,
+  opts?: { selector?: string; timeoutMs?: number },
+): Promise<WebViewScanResult> {
   const browser = getBrowser();
   const originalCtx = await getCurrentContext();
+  const timeoutMs = opts?.timeoutMs ?? 1500;
 
   try {
     await switchToContextById(contextId);
 
     // Execute JS to extract all interactive elements from the DOM
-    const rawElements = await Promise.race([
-      browser.execute(EXTRACT_INTERACTIVE_JS),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('WebView scan timeout')), 1500)),
-    ]) as WebViewRawElement[];
+    const rawResult = await Promise.race([
+      browser.execute(buildExtractInteractiveJs(opts?.selector)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('WebView scan timeout')), timeoutMs)),
+    ]) as { error?: string; total: number; truncated: boolean; items: WebViewRawElement[] } | WebViewRawElement[];
 
-    if (!Array.isArray(rawElements) || rawElements.length === 0) {
-      return [];
+    // Normalize (older shape was a bare array)
+    const payload = Array.isArray(rawResult)
+      ? { total: rawResult.length, truncated: false, items: rawResult }
+      : rawResult;
+    if (!payload || payload.error) {
+      throw new Error(payload?.error ?? 'empty scan result');
     }
+    const rawElements = payload.items ?? [];
 
     const elements: InteractiveElement[] = [];
     for (let i = 0; i < rawElements.length; i++) {
@@ -481,18 +503,16 @@ export async function scanWebViewInteractiveElements(
       const tag = raw.tag.toLowerCase();
       const flutterType = HTML_TYPE_MAP[tag] || 'TextButton';
 
-      // Build best CSS selector: #id → [name=x] → tag.class → tag with text
+      // Build best CSS selector: #id → [data-event-id] → [name=x] → tag.class → tag
       let cssSelector: string;
       if (raw.id) {
         cssSelector = `#${raw.id}`;
+      } else if (raw.dataEventId) {
+        cssSelector = `[data-event-id="${raw.dataEventId}"]`;
       } else if (raw.name) {
         cssSelector = `${tag}[name="${raw.name}"]`;
       } else if (raw.classes && raw.classes.length > 0) {
         cssSelector = `${tag}.${raw.classes.slice(0, 2).join('.')}`;
-      } else if (raw.text) {
-        // Use xpath-like text matching as CSS can't match by text content
-        // Fall back to tag-based selector
-        cssSelector = tag;
       } else {
         cssSelector = tag;
       }
@@ -516,11 +536,11 @@ export async function scanWebViewInteractiveElements(
       });
     }
 
-    logger.info('WebView scan complete', { contextId, elements: elements.length });
-    return elements;
+    logger.info('WebView scan complete', { contextId, elements: elements.length, total: payload.total, truncated: payload.truncated });
+    return { elements, total: payload.total, truncated: payload.truncated };
   } catch (error) {
     logger.debug('WebView scan failed (non-critical)', { contextId, error: String(error) });
-    return [];
+    return { elements: [], total: 0, truncated: false };
   } finally {
     // Restore original context
     if (originalCtx !== contextId) {
@@ -538,20 +558,39 @@ interface WebViewRawElement {
   type?: string;
   href?: string;
   role?: string;
+  dataEventId?: string;
   disabled?: boolean;
   rect?: { x: number; y: number; width: number; height: number };
 }
 
 /**
- * JavaScript executed inside the WebView to extract interactive elements.
- * Returns a JSON-serializable array of element descriptors.
+ * Default interactive-element selector set. `[data-event-id]` covers JS
+ * scheduler widgets (Bryntum appointment cards are plain divs carrying
+ * data-event-id — no role/onclick/tabindex, so the classic set misses them).
  */
-const EXTRACT_INTERACTIVE_JS = `
+const DEFAULT_INTERACTIVE_SELECTORS =
+  'button, a[href], input, select, textarea, [role="button"], [onclick], [tabindex], [data-event-id], [contenteditable="true"]';
+
+const MAX_WEBVIEW_ELEMENTS = 150;
+
+/**
+ * Build the in-page extraction script. `extraSelector` widens the scan (e.g.
+ * ".b-sch-event" to enumerate Bryntum cards). Only VISIBLE elements count
+ * toward the cap, and the result reports total/truncated so a cut-off scan
+ * never silently reads as "covered everything".
+ */
+function buildExtractInteractiveJs(extraSelector?: string): string {
+  const selectors = extraSelector
+    ? `${DEFAULT_INTERACTIVE_SELECTORS}, ${extraSelector}`
+    : DEFAULT_INTERACTIVE_SELECTORS;
+  return `
 return (function() {
-  var selectors = 'button, a[href], input, select, textarea, [role="button"], [onclick], [tabindex]';
-  var nodes = document.querySelectorAll(selectors);
+  var nodes;
+  try { nodes = document.querySelectorAll(${JSON.stringify(selectors)}); }
+  catch (e) { return { error: 'bad selector: ' + e.message, total: 0, truncated: false, items: [] }; }
   var results = [];
-  for (var i = 0; i < nodes.length && i < 100; i++) {
+  var total = 0;
+  for (var i = 0; i < nodes.length; i++) {
     var el = nodes[i];
     var rect = el.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) continue;
@@ -560,19 +599,23 @@ return (function() {
       var inputType = (el.type || 'text').toLowerCase();
       if (inputType === 'hidden') continue;
     }
+    total++;
+    if (results.length >= ${MAX_WEBVIEW_ELEMENTS}) continue;
     results.push({
       tag: tag,
       text: (el.textContent || el.value || el.placeholder || '').trim().substring(0, 100),
       id: el.id || null,
       name: el.name || null,
-      classes: el.className ? el.className.split(/\\s+/).filter(function(c) { return c.length > 0; }).slice(0, 3) : [],
+      classes: el.className && typeof el.className === 'string' ? el.className.split(/\\s+/).filter(function(c) { return c.length > 0; }).slice(0, 3) : [],
       type: el.type || null,
       href: el.href || null,
       role: el.getAttribute('role') || null,
+      dataEventId: el.getAttribute('data-event-id') || null,
       disabled: el.disabled === true,
       rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
     });
   }
-  return results;
+  return { total: total, truncated: total > results.length, items: results };
 })();
 `;
+}

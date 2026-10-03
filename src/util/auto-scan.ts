@@ -4,7 +4,7 @@
  * automatically, eliminating the need for follow-up get_screen/get_widget_tree calls.
  */
 
-import { pageSourceScan } from '../tree/page-source-scanner.js';
+import { getScreenElements } from './element-source.js';
 import { captureScreenshot } from './screenshot.js';
 import { formatElementsCompact, formatElementsSummaryLine } from './element-format.js';
 import { trackScreenTransition } from '../context/screen-map-store.js';
@@ -34,7 +34,7 @@ export async function autoScan(
   let elements: InteractiveElement[] = [];
 
   try {
-    elements = await pageSourceScan();
+    ({ elements } = await getScreenElements());
 
     // Track screen in persistent screen map (non-critical)
     try { trackScreenTransition(elements, options?.action); } catch { /* ignore */ }
@@ -78,7 +78,7 @@ export async function autoScanElementsOnly(
   action?: { by: string; value: string },
 ): Promise<McpToolResponse['content']> {
   try {
-    const elements = await pageSourceScan();
+    const { elements } = await getScreenElements();
 
     // Track screen in persistent screen map (non-critical)
     try { trackScreenTransition(elements, action); } catch { /* ignore */ }

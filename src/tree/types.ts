@@ -2,6 +2,7 @@ export interface WidgetNode {
   type: string;
   key?: string;
   text?: string;
+  semanticsLabel?: string;
   enabled?: boolean;
   displayed?: boolean;
   position?: { x: number; y: number; width: number; height: number };
@@ -107,8 +108,10 @@ export const INTERACTIVE_WIDGET_TYPES = [
   'Icon',
   'ImageIcon',
   'CircleAvatar',
-  // Common third-party / community widgets
   'AutoSizeTextField',
+  'AppointmentCard',
+  'GuestCard',
+  'ServiceCard',
 ];
 
 // Layout-only widgets to filter from condensed tree

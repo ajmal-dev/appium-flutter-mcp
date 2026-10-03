@@ -36,8 +36,12 @@ export interface Recording {
   stoppedAt?: string;
   platform: 'ios' | 'android' | 'unknown';
   actions: RecordedAction[];
-  /** User-provided metadata */
+  /** User-provided test metadata */
   metadata: {
+    testClassName?: string;
+    testMethodName?: string;
+    testGroups?: string[];
+    packageName?: string;
     description?: string;
   };
 }
@@ -56,7 +60,7 @@ export function getActiveRecording(): Recording | null {
   return activeRecording;
 }
 
-/** Get the last completed recording (available after stop_recording) */
+/** Get the last completed recording (available for generate_test after stop) */
 export function getLastRecording(): Recording | null {
   return lastRecording;
 }

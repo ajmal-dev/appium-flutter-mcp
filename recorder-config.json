@@ -1,0 +1,9 @@
+{
+  "APPIUM_URL": "http://127.0.0.1:4723",
+  "PLATFORM": "ios",
+  "APPIUM_UDID": "",
+  "APPIUM_BUNDLE_ID": "",
+  "APPIUM_NO_RESET": "true",
+  "APPIUM_FULL_RESET": "false",
+  "APPIUM_SHOULD_TERMINATE_APP": "false"
+}

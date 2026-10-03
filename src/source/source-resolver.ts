@@ -3,19 +3,14 @@
  *
  * The Dart VM returns creation locations as either:
  * - Package URIs: package:my_app/screens/MainScreen.dart
- * - Absolute paths: /Users/.../my_app/lib/screens/MainScreen.dart
+ * - Absolute paths: /path/to/my_app/lib/screens/MainScreen.dart
  *
- * This module maps them to actual filesystem paths using FLUTTER_APP_PATH
- * and FLUTTER_COMPONENTS_PATH.
- *
- * Convention: the main app's pub package name is assumed to match
- * basename(FLUTTER_APP_PATH). For apps where the package name differs
- * from the directory name, you can either symlink or set FLUTTER_APP_PATH
- * to the package root containing pubspec.yaml + lib/.
+ * This module maps them to filesystem paths using FLUTTER_APP_PATH
+ * and FLUTTER_COMPONENTS_PATH. The app package name is read from pubspec.yaml.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { basename, join } from 'path';
+import { join } from 'path';
 import { logger } from '../util/logger.js';
 
 // ── Package-to-path mapping ────────────────────────────────────────────────
@@ -27,6 +22,13 @@ interface PackageMapping {
 
 let packageMappings: PackageMapping[] | null = null;
 
+function packageNameFromPubspec(dir: string): string | undefined {
+  const pubspec = join(dir, 'pubspec.yaml');
+  if (!existsSync(pubspec)) return undefined;
+  const match = readFileSync(pubspec, 'utf8').match(/^name:\s*([A-Za-z0-9_]+)/m);
+  return match?.[1];
+}
+
 /**
  * Build package-to-filesystem mappings from the configured source paths.
  */
@@ -36,16 +38,15 @@ export function buildPackageMappings(
 ): PackageMapping[] {
   const mappings: PackageMapping[] = [];
 
-  // The main app: package:<name>/ → {flutterAppPath}/lib/
   if (flutterAppPath) {
     const appLib = join(flutterAppPath, 'lib');
-    if (existsSync(appLib)) {
-      const packageName = readPubspecName(flutterAppPath) || basename(flutterAppPath);
+    const packageName = packageNameFromPubspec(flutterAppPath);
+    if (packageName && existsSync(appLib)) {
       mappings.push({ packageName, libPath: appLib });
     }
   }
 
-  // Flutter component packages: each subdir of FLUTTER_COMPONENTS_PATH is a pub package
+  // Flutter component packages
   if (flutterComponentsPath && existsSync(flutterComponentsPath)) {
     try {
       const entries = readdirSync(flutterComponentsPath);
@@ -55,8 +56,7 @@ export function buildPackageMappings(
           if (!statSync(pkgDir).isDirectory()) continue;
           const libDir = join(pkgDir, 'lib');
           if (existsSync(libDir)) {
-            const packageName = readPubspecName(pkgDir) || entry;
-            mappings.push({ packageName, libPath: libDir });
+            mappings.push({ packageName: entry, libPath: libDir });
           }
         } catch { /* skip */ }
       }
@@ -71,7 +71,8 @@ export function buildPackageMappings(
  * Resolve a Dart VM creationLocation file path to an actual filesystem path.
  *
  * Handles:
- * - package:<name>/x.dart → mapped lib/ + x.dart
+ * - package:my_app/x.dart → {FLUTTER_APP_PATH}/lib/x.dart
+ * - package:shared_widgets/x.dart → {FLUTTER_COMPONENTS_PATH}/shared_widgets/lib/x.dart
  * - Absolute paths → returned as-is if they exist
  */
 export function resolveCreationLocation(
@@ -140,19 +141,4 @@ export function readWidgetSource(
  */
 export function clearPackageMappings(): void {
   packageMappings = null;
-}
-
-/**
- * Read the `name:` field from a pubspec.yaml. Returns null on any failure.
- */
-function readPubspecName(packageDir: string): string | null {
-  try {
-    const pubspec = join(packageDir, 'pubspec.yaml');
-    if (!existsSync(pubspec)) return null;
-    const content = readFileSync(pubspec, 'utf-8');
-    const match = content.match(/^name\s*:\s*([A-Za-z0-9_]+)/m);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  }
 }

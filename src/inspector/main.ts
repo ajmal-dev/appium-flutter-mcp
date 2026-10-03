@@ -8,6 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { buildVMWidgetTree, findNodeAtPosition } from '../vm/vm-widget-tree.js';
 import type { VMWidgetNode } from '../vm/vm-widget-tree.js';
+import { extractDeepLocators } from '../vm/deep-locators.js';
 import { captureDeviceScreenshot, detectPlatform } from '../vm/device-screenshot.js';
 import type { DevicePlatform } from '../vm/device-screenshot.js';
 
@@ -595,66 +596,6 @@ ipcMain.handle('screenshot:stopStream', async () => {
   if (screenshotInterval) { clearInterval(screenshotInterval); screenshotInterval = null; }
   return { streaming: false };
 });
-
-// --- Deep Locator Extraction ---
-
-async function extractDeepLocators(
-  client: DartVMClient, valueId: string, selectedType: string,
-): Promise<Array<{ by: string; value: string; confidence: number }>> {
-  const found = { keys: [] as string[], texts: [] as string[], semantics: [] as string[], tooltips: [] as string[] };
-
-  async function deepWalk(vid: string, depth: number) {
-    if (depth > 6 || (found.keys.length > 0 && found.texts.length > 0)) return;
-    try {
-      const details = await client.callServiceExtension(
-        'ext.flutter.inspector.getDetailsSubtree',
-        { arg: vid, objectGroup: 'inspector-group', subtreeDepth: 2 },
-      ) as any;
-      const node = details?.result || details;
-      if (!node) return;
-      extractFromProperties(node, found);
-      if (node.children && Array.isArray(node.children)) {
-        for (const child of node.children) {
-          if (child?.valueId) await deepWalk(child.valueId, depth + 1);
-        }
-      }
-    } catch {}
-  }
-
-  await deepWalk(valueId, 0);
-
-  const locators: Array<{ by: string; value: string; confidence: number }> = [];
-  for (const key of found.keys) locators.push({ by: 'key', value: key, confidence: 1.0 });
-  for (const s of found.semantics) locators.push({ by: 'semanticsLabel', value: s, confidence: 0.9 });
-  for (const t of found.texts) locators.push({ by: 'text', value: t, confidence: 0.8 });
-  for (const t of found.tooltips) locators.push({ by: 'tooltip', value: t, confidence: 0.75 });
-  locators.push({ by: 'type', value: selectedType.split('<')[0], confidence: 0.4 });
-  return locators;
-}
-
-function extractFromProperties(node: any, found: { keys: string[]; texts: string[]; semantics: string[]; tooltips: string[] }) {
-  if (!node.properties || !Array.isArray(node.properties)) return;
-  for (const prop of node.properties) {
-    const name = prop.name;
-    const desc = prop.description;
-    if (!desc || desc === 'null' || desc === '<null>') continue;
-    if (name === 'key') {
-      const m = desc.match(/(?:ValueKey|Key)\S*\(\s*'([^']+)'\s*\)/) || desc.match(/\[<'([^']+)'>\]/);
-      if (m) found.keys.push(m[1]);
-    }
-    if (['data', 'text', 'hintText', 'labelText'].includes(name)) {
-      const text = desc.replace(/^"|"$/g, '').trim();
-      if (text && text.length < 200) found.texts.push(text);
-    }
-    if (['semanticLabel', 'semanticsLabel', 'label'].includes(name)) {
-      found.semantics.push(desc.replace(/^"|"$/g, '').trim());
-    }
-    if (name === 'tooltip') found.tooltips.push(desc.replace(/^"|"$/g, '').trim());
-  }
-  if (node.children && Array.isArray(node.children)) {
-    for (const child of node.children) extractFromProperties(child, found);
-  }
-}
 
 // --- App Lifecycle ---
 app.whenReady().then(createWindow);
